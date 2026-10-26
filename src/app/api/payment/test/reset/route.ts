@@ -14,7 +14,7 @@ async function handleReset(request: Request) {
     }
 
     const targetReg = registrationNumber ? registrationNumber.trim() : 'all';
-    paymentStore.resetUserDues(targetReg);
+    await paymentStore.resetUserDues(targetReg);
 
     return NextResponse.json({
       success: true,

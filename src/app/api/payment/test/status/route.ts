@@ -15,7 +15,7 @@ export async function GET(request: Request) {
       );
     }
 
-    const order = paymentStore.getOrder(orderId);
+    const order = await paymentStore.getOrder(orderId);
 
     if (!order) {
       return NextResponse.json(

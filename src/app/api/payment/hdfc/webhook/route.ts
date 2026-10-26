@@ -33,7 +33,7 @@ export async function POST(request: Request) {
       return NextResponse.json({ error: 'Missing order_id in webhook payload' }, { status: 400 });
     }
 
-    const order = paymentStore.getOrder(orderId);
+    const order = await paymentStore.getOrder(orderId);
     if (!order) {
       return NextResponse.json({ received: true, note: 'Order not found in store' });
     }
@@ -45,13 +45,13 @@ export async function POST(request: Request) {
     const bankRef = bankStatus?.bank_ref_no || bankStatus?.payment_gateway_response?.rrn || `HDFC_${Date.now()}`;
 
     if (status === 'CHARGED' || status === 'SUCCESS') {
-      paymentStore.approvePayment(orderId, 'HDFC SmartGateway (Webhook)', txnId, bankRef);
+      await paymentStore.approvePayment(orderId, 'HDFC SmartGateway (Webhook)', txnId, bankRef);
       console.log(`[HDFC Webhook] Order ${orderId} successfully marked as CHARGED`);
     } else if (status === 'USER_ABORTED' || status === 'CANCELLED') {
-      paymentStore.cancelPayment(orderId, 'Webhook cancellation notification from bank');
+      await paymentStore.cancelPayment(orderId, 'Webhook cancellation notification from bank');
       console.log(`[HDFC Webhook] Order ${orderId} marked as CANCELLED`);
     } else if (status === 'FAILED' || status === 'DECLINED') {
-      paymentStore.markPaymentFailed(orderId, bankStatus?.resp_message || 'Webhook failed notification from bank');
+      await paymentStore.markPaymentFailed(orderId, bankStatus?.resp_message || 'Webhook failed notification from bank');
       console.log(`[HDFC Webhook] Order ${orderId} marked as FAILED`);
     }
 

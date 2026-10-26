@@ -24,7 +24,7 @@ export async function POST(request: Request) {
     }
 
     // 1. Server-side Due Verification & Anti-Tampering Check
-    const result = paymentStore.initiateOrder({
+    const result = await paymentStore.initiateOrder({
       dueId,
       candidateName,
       candidateEmail,

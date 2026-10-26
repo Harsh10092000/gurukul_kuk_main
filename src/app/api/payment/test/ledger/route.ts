@@ -15,7 +15,7 @@ export async function GET(request: Request) {
       );
     }
 
-    const ledger = paymentStore.getUserLedger(registrationNumber);
+    const ledger = await paymentStore.getUserLedger(registrationNumber);
 
     return NextResponse.json({
       success: true,

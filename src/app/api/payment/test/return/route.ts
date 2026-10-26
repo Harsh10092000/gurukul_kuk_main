@@ -31,29 +31,53 @@ async function extractOrderParams(request: Request): Promise<{ orderId: string |
   let orderId = url.searchParams.get('order_id') || url.searchParams.get('orderId');
   let body: any = {};
 
+  // Copy all searchParams into body
+  url.searchParams.forEach((val, key) => {
+    body[key] = val;
+  });
+
   if (request.method === 'POST') {
-    const contentType = request.headers.get('content-type') || '';
     try {
-      if (contentType.includes('application/x-www-form-urlencoded') || contentType.includes('multipart/form-data')) {
-        const formData = await request.formData();
-        const formOrderId = formData.get('order_id') || formData.get('orderId');
-        if (formOrderId && typeof formOrderId === 'string') {
-          orderId = formOrderId;
+      const rawText = await request.text();
+      console.log('[HDFC SmartGateway Return Raw Body]:', rawText);
+
+      // Parse form-urlencoded
+      if (rawText && rawText.includes('=')) {
+        try {
+          const formParams = new URLSearchParams(rawText);
+          formParams.forEach((val, key) => {
+            body[key] = val;
+          });
+          const formOrderId = formParams.get('order_id') || formParams.get('orderId');
+          if (formOrderId) orderId = formOrderId;
+        } catch (e) {
+          console.warn('[HDFC Return] URLSearchParams parse error:', e);
         }
-        formData.forEach((val, key) => {
-          body[key] = val;
-        });
-      } else if (contentType.includes('application/json')) {
-        const json = await request.json();
-        body = json;
-        if (json.order_id || json.orderId) {
-          orderId = json.order_id || json.orderId;
+      }
+
+      // Parse JSON
+      if (rawText && (rawText.trim().startsWith('{') || rawText.trim().startsWith('['))) {
+        try {
+          const json = JSON.parse(rawText);
+          Object.assign(body, json);
+          if (json.order_id || json.orderId) {
+            orderId = json.order_id || json.orderId;
+          }
+        } catch (e) {
+          console.warn('[HDFC Return] JSON parse error:', e);
         }
       }
     } catch (e) {
-      console.warn('Could not parse POST body in HDFC test return handler:', e);
+      console.warn('Could not read POST body in HDFC test return handler:', e);
     }
   }
+
+  console.log('[HDFC SmartGateway Return Extracted]:', {
+    method: request.method,
+    url: request.url,
+    orderId,
+    body,
+  });
 
   return { orderId, body };
 }
@@ -65,7 +89,7 @@ async function handleHdfcReturn(request: Request) {
     return safeRedirect('/payment?step=pay&status=error&msg=Missing+Order+Identifier', request);
   }
 
-  const paymentOrder = paymentStore.getOrder(orderId);
+  const paymentOrder = await paymentStore.getOrder(orderId);
   const urlObj = new URL(request.url);
   const dueId = urlObj.searchParams.get('dueId') || paymentOrder?.dueId || '';
   const dueTitle = urlObj.searchParams.get('dueTitle') || paymentOrder?.dueTitle || '';
@@ -78,32 +102,74 @@ async function handleHdfcReturn(request: Request) {
   // (Prevents sandbox/dummy PG auto-authorization from overriding explicit OTP cancellation)
   const rawStatus = (
     body?.status ||
+    body?.order_status ||
+    body?.payment_status ||
+    body?.txn_status ||
+    body?.response_status ||
     urlObj.searchParams.get('status') ||
     urlObj.searchParams.get('payment') ||
+    urlObj.searchParams.get('order_status') ||
     ''
   ).toUpperCase();
 
-  const rawStatusId = Number(body?.status_id || urlObj.searchParams.get('status_id') || 0);
-  const errorCode = (body?.error_code || urlObj.searchParams.get('error_code') || '').toUpperCase();
-  const errorMsg = (body?.error_message || body?.resp_message || urlObj.searchParams.get('msg') || '').toLowerCase();
+  const rawStatusId = Number(
+    body?.status_id ||
+    body?.order_status_id ||
+    body?.payment_status_id ||
+    urlObj.searchParams.get('status_id') ||
+    urlObj.searchParams.get('statusId') ||
+    0
+  );
+
+  const errorCode = (
+    body?.error_code ||
+    body?.errorCode ||
+    body?.resp_code ||
+    body?.response_code ||
+    urlObj.searchParams.get('error_code') ||
+    urlObj.searchParams.get('errorCode') ||
+    ''
+  ).toUpperCase();
+
+  const errorMsg = (
+    body?.error_message ||
+    body?.errorMessage ||
+    body?.resp_message ||
+    body?.response_message ||
+    body?.status_message ||
+    body?.status_desc ||
+    urlObj.searchParams.get('msg') ||
+    urlObj.searchParams.get('error_message') ||
+    ''
+  ).toLowerCase();
 
   const isExplicitAbortOrCancel =
-    rawStatus === 'USER_ABORTED' ||
-    rawStatus === 'CANCELLED' ||
-    rawStatus === 'AUTHENTICATION_FAILED' ||
-    rawStatus === 'USER_DROPPED' ||
-    rawStatus === 'CUSTOMER_DROPPED' ||
-    rawStatus === 'DROPPED' ||
+    rawStatus.includes('CANCEL') ||
+    rawStatus.includes('ABORT') ||
+    rawStatus.includes('AUTHENTICATION_FAILED') ||
+    rawStatus.includes('AUTHORIZATION_FAILED') ||
+    rawStatus.includes('DECLINED') ||
+    rawStatus.includes('DROP') ||
+    rawStatus.includes('FAIL') ||
     rawStatusId === 26 || // AUTHENTICATION_FAILED (Juspay standard code for OTP cancel/failure)
-    rawStatusId === 27 || // USER_ABORTED (User clicked Cancel on gateway)
+    rawStatusId === 27 || // USER_ABORTED / AUTHORIZATION_FAILED
+    rawStatusId === 28 || // JUSPAY_DECLINED
+    rawStatusId === 31 || // VOIDED / CANCELLED
     errorCode === 'JP_002' ||
-    errorCode === 'AUTHENTICATION_FAILED' ||
+    errorCode.includes('CANCEL') ||
+    errorCode.includes('ABORT') ||
+    errorCode.includes('FAIL') ||
+    errorCode.includes('DECLINE') ||
     errorMsg.includes('abort') ||
-    errorMsg.includes('cancel');
+    errorMsg.includes('cancel') ||
+    errorMsg.includes('fail') ||
+    errorMsg.includes('decline') ||
+    urlObj.searchParams.get('status') === 'cancelled' ||
+    urlObj.searchParams.get('status') === 'canceled';
 
   if (isExplicitAbortOrCancel) {
-    console.log(`[HDFC SmartGateway Return] Order ${orderId} was cancelled/aborted by user (status: ${rawStatus}, status_id: ${rawStatusId})`);
-    paymentStore.cancelPayment(orderId, 'User cancelled payment at bank OTP / authorization screen');
+    console.log(`[HDFC SmartGateway Return] Order ${orderId} was cancelled/aborted by user (status: ${rawStatus}, status_id: ${rawStatusId}, msg: ${errorMsg})`);
+    await paymentStore.cancelPayment(orderId, 'User cancelled payment at bank OTP / authorization screen');
     return safeRedirect(
       `/payment?step=pay&orderId=${encodeURIComponent(orderId)}&status=cancelled&msg=Payment+was+cancelled+at+the+bank+OTP+screen.+Your+due+remains+pending;+click+Pay+to+retry.`,
       request
@@ -126,7 +192,7 @@ async function handleHdfcReturn(request: Request) {
   } catch (err: any) {
     console.warn('[HDFC SmartGateway] Status check error:', err?.message);
     if (isExplicitAbortOrCancel) {
-      paymentStore.cancelPayment(orderId, 'User aborted payment session at bank');
+      await paymentStore.cancelPayment(orderId, 'User aborted payment session at bank');
       return safeRedirect(`/payment?step=pay&orderId=${encodeURIComponent(orderId)}&status=cancelled`, request);
     }
 
@@ -156,19 +222,19 @@ async function handleHdfcReturn(request: Request) {
 
   // Check if bank API itself reports cancellation or OTP authentication failure
   const isApiCancelled =
-    apiStatus === 'USER_ABORTED' ||
-    apiStatus === 'CANCELLED' ||
-    apiStatus === 'AUTHENTICATION_FAILED' ||
-    apiStatus === 'USER_DROPPED' ||
-    apiStatus === 'DROPPED' ||
+    apiStatus.includes('CANCEL') ||
+    apiStatus.includes('ABORT') ||
+    apiStatus.includes('AUTHENTICATION_FAILED') ||
+    apiStatus.includes('DROP') ||
     apiStatusId === 26 || // AUTHENTICATION_FAILED
     apiStatusId === 27 || // USER_ABORTED
-    txnStatus === 'USER_ABORTED' ||
-    txnStatus === 'CANCELLED' ||
-    txnStatus === 'AUTHENTICATION_FAILED';
+    apiStatusId === 31 || // VOIDED
+    txnStatus.includes('CANCEL') ||
+    txnStatus.includes('ABORT') ||
+    txnStatus.includes('AUTHENTICATION_FAILED');
 
   if (isApiCancelled) {
-    paymentStore.cancelPayment(orderId, statusResponse?.resp_message || 'Payment cancelled or authentication aborted at bank OTP screen');
+    await paymentStore.cancelPayment(orderId, statusResponse?.resp_message || 'Payment cancelled or authentication aborted at bank OTP screen');
     return safeRedirect(
       `/payment?step=pay&orderId=${encodeURIComponent(orderId)}&status=cancelled&msg=Payment+authentication+was+cancelled+or+failed.+Your+due+remains+pending;+click+Pay+to+retry.`,
       request
@@ -177,19 +243,17 @@ async function handleHdfcReturn(request: Request) {
 
   // Check if bank API reports failure / decline
   const isApiDeclinedOrFailed =
-    apiStatus === 'AUTHORIZATION_FAILED' ||
-    apiStatus === 'JUSPAY_DECLINED' ||
-    apiStatus === 'DECLINED' ||
-    apiStatus === 'FAILED' ||
-    apiStatus === 'FAILURE' ||
+    apiStatus.includes('AUTHORIZATION_FAILED') ||
+    apiStatus.includes('DECLINED') ||
+    apiStatus.includes('FAIL') ||
     apiStatusId === 25 || // AUTHORIZATION_FAILED
     apiStatusId === 28 || // JUSPAY_DECLINED
-    txnStatus === 'AUTHORIZATION_FAILED' ||
-    txnStatus === 'DECLINED' ||
-    txnStatus === 'FAILED';
+    txnStatus.includes('AUTHORIZATION_FAILED') ||
+    txnStatus.includes('DECLINED') ||
+    txnStatus.includes('FAIL');
 
   if (isApiDeclinedOrFailed) {
-    paymentStore.markPaymentFailed(orderId, statusResponse?.resp_message || 'Payment declined by issuing bank');
+    await paymentStore.markPaymentFailed(orderId, statusResponse?.resp_message || 'Payment declined by issuing bank');
     return safeRedirect(
       `/payment?step=pay&orderId=${encodeURIComponent(orderId)}&status=failed&msg=Payment+was+declined+by+bank.+Your+due+remains+pending;+click+Pay+to+retry.`,
       request
@@ -200,7 +264,7 @@ async function handleHdfcReturn(request: Request) {
   const isSuccess = apiStatus === 'CHARGED' || apiStatus === 'SUCCESS';
 
   if (isSuccess) {
-    paymentStore.approvePayment(orderId, 'HDFC SmartGateway', txnId, bankRef);
+    await paymentStore.approvePayment(orderId, 'HDFC SmartGateway', txnId, bankRef);
 
     return safeRedirect(
       `/payment?step=thankyou&orderId=${encodeURIComponent(orderId)}&txnId=${encodeURIComponent(txnId)}&amount=${encodeURIComponent(String(expectedAmount))}&dueId=${encodeURIComponent(dueId)}&dueTitle=${encodeURIComponent(dueTitle)}&status=success`,
@@ -211,7 +275,7 @@ async function handleHdfcReturn(request: Request) {
   // 5. UNFINISHED / NEW / ABANDONED STATUS WHEN RETURNING TO PORTAL
   // If the candidate lands back on return_url while the bank status is still NEW, STARTED, or PENDING,
   // it signifies they pressed back, closed the gateway, or clicked cancel before completing payment.
-  paymentStore.cancelPayment(orderId, 'Payment was cancelled or abandoned before authorization');
+  await paymentStore.cancelPayment(orderId, 'Payment was cancelled or abandoned before authorization');
   return safeRedirect(
     `/payment?step=pay&orderId=${encodeURIComponent(orderId)}&status=cancelled&msg=Payment+session+was+cancelled+or+abandoned.+Your+fee+due+remains+pending;+click+Pay+to+retry.`,
     request

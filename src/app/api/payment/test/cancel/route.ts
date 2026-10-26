@@ -16,7 +16,7 @@ export async function POST(request: Request) {
       );
     }
 
-    const result = paymentStore.cancelPayment(orderId, reason);
+    const result = await paymentStore.cancelPayment(orderId, reason);
 
     if (!result.success) {
       return NextResponse.json(

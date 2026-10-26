@@ -16,7 +16,7 @@ export async function POST(request: Request) {
       );
     }
 
-    const result = paymentStore.approvePayment(orderId, paymentMethod);
+    const result = await paymentStore.approvePayment(orderId, paymentMethod);
 
     if (!result.success || !result.order) {
       return NextResponse.json(

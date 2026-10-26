@@ -1,7 +1,6 @@
-import fs from 'fs';
-import path from 'path';
 import crypto from 'crypto';
 import { getTestFeeDue, FeeDueItem } from './testFeeDues';
+import { getDbPool, ensureDatabaseTables } from './db';
 
 export type PaymentOrderStatus = 'PENDING' | 'CHARGED' | 'CANCELLED' | 'FAILED';
 
@@ -39,47 +38,30 @@ export interface UserDueLedger {
   }>;
 }
 
-const DATA_DIR = path.join(process.cwd(), 'data');
-const ORDERS_FILE = path.join(DATA_DIR, 'payment_orders.json');
-const LEDGER_FILE = path.join(DATA_DIR, 'user_ledgers.json');
 const SECRET_SALT = 'GURUKUL_KURUKSHETRA_SECURITY_SALT_2026';
 
-function ensureDataDir() {
-  if (!fs.existsSync(DATA_DIR)) {
-    fs.mkdirSync(DATA_DIR, { recursive: true });
-  }
-}
-
-function loadOrders(): Record<string, PaymentOrderRecord> {
-  ensureDataDir();
-  if (!fs.existsSync(ORDERS_FILE)) return {};
-  try {
-    const raw = fs.readFileSync(ORDERS_FILE, 'utf8');
-    return JSON.parse(raw);
-  } catch {
-    return {};
-  }
-}
-
-function saveOrders(orders: Record<string, PaymentOrderRecord>) {
-  ensureDataDir();
-  fs.writeFileSync(ORDERS_FILE, JSON.stringify(orders, null, 2), 'utf8');
-}
-
-function loadLedgers(): Record<string, UserDueLedger> {
-  ensureDataDir();
-  if (!fs.existsSync(LEDGER_FILE)) return {};
-  try {
-    const raw = fs.readFileSync(LEDGER_FILE, 'utf8');
-    return JSON.parse(raw);
-  } catch {
-    return {};
-  }
-}
-
-function saveLedgers(ledgers: Record<string, UserDueLedger>) {
-  ensureDataDir();
-  fs.writeFileSync(LEDGER_FILE, JSON.stringify(ledgers, null, 2), 'utf8');
+function mapRowToOrder(row: any): PaymentOrderRecord {
+  return {
+    orderId: row.order_id,
+    dueId: row.due_id,
+    dueTitle: row.due_title,
+    amount: Number(row.amount),
+    currency: row.currency || 'INR',
+    status: row.status as PaymentOrderStatus,
+    candidateName: row.candidate_name,
+    candidateEmail: row.candidate_email,
+    candidatePhone: row.candidate_phone,
+    registrationNumber: row.registration_number,
+    checksum: row.checksum,
+    txnId: row.txn_id || undefined,
+    paymentMethod: row.payment_method || undefined,
+    bankRef: row.bank_ref || undefined,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+    cancelledAt: row.cancelled_at || undefined,
+    paidAt: row.paid_at || undefined,
+    cancelReason: row.cancel_reason || undefined,
+  };
 }
 
 /**
@@ -113,7 +95,7 @@ export const paymentStore = {
   /**
    * INITIATE ORDER with Anti-Tampering & Double-Payment Guards
    */
-  initiateOrder(params: {
+  async initiateOrder(params: {
     dueId: string;
     candidateName: string;
     candidateEmail: string;
@@ -121,7 +103,10 @@ export const paymentStore = {
     registrationNumber: string;
     clientReportedAmount?: number; // Tested against server truth
     isRePay?: boolean;
-  }): { success: boolean; order?: PaymentOrderRecord; error?: string; code?: string } {
+  }): Promise<{ success: boolean; order?: PaymentOrderRecord; error?: string; code?: string }> {
+    await ensureDatabaseTables();
+    const db = getDbPool();
+
     const { dueId, candidateName, candidateEmail, candidatePhone, registrationNumber, clientReportedAmount, isRePay } = params;
 
     // 1. Resolve Fee Due strictly from server catalog
@@ -131,7 +116,6 @@ export const paymentStore = {
     }
 
     // 2. CHECK FOR AMOUNT TAMPERING
-    // If the client provided an amount that deviates from the server-side price, flag tampering!
     if (clientReportedAmount !== undefined && Math.abs(clientReportedAmount - due.amount) > 0.001) {
       console.warn(`[SECURITY ALERT] Amount tampering detected! Client sent ₹${clientReportedAmount}, server catalog requires ₹${due.amount}`);
       return {
@@ -143,13 +127,15 @@ export const paymentStore = {
 
     // 3. CHECK FOR DOUBLE PAYMENT: Has this user already settled this due?
     if (!isRePay) {
-      const ledgers = loadLedgers();
-      const userLedger = ledgers[registrationNumber];
-      if (userLedger?.paidDues && userLedger.paidDues[dueId]) {
-        const existing = userLedger.paidDues[dueId];
+      const [existingLedgers]: any = await db.query(
+        'SELECT * FROM user_ledgers WHERE registration_number = ? AND due_id = ? LIMIT 1',
+        [registrationNumber, dueId]
+      );
+      if (existingLedgers && existingLedgers.length > 0) {
+        const existing = existingLedgers[0];
         return {
           success: false,
-          error: `Double Payment Guard: Due "${due.title}" (${dueId}) has already been paid under Order ${existing.orderId} (Txn: ${existing.txnId}) on ${existing.paidAt}.`,
+          error: `Double Payment Guard: Due "${due.title}" (${dueId}) has already been paid under Order ${existing.order_id} (Txn: ${existing.txn_id}) on ${existing.paid_at}.`,
           code: 'ALREADY_PAID',
         };
       }
@@ -158,6 +144,7 @@ export const paymentStore = {
     // 4. Create new order with server-verified amount
     const orderId = this.generateOrderId();
     const checksum = calculateOrderChecksum(orderId, due.id, due.amount, registrationNumber);
+    const now = new Date().toISOString();
 
     const newOrder: PaymentOrderRecord = {
       orderId,
@@ -171,13 +158,32 @@ export const paymentStore = {
       candidatePhone,
       registrationNumber,
       checksum,
-      createdAt: new Date().toISOString(),
-      updatedAt: new Date().toISOString(),
+      createdAt: now,
+      updatedAt: now,
     };
 
-    const orders = loadOrders();
-    orders[orderId] = newOrder;
-    saveOrders(orders);
+    await db.query(
+      `INSERT INTO payment_orders (
+        order_id, due_id, due_title, amount, currency, status,
+        candidate_name, candidate_email, candidate_phone, registration_number,
+        checksum, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [
+        newOrder.orderId,
+        newOrder.dueId,
+        newOrder.dueTitle,
+        newOrder.amount,
+        newOrder.currency,
+        newOrder.status,
+        newOrder.candidateName,
+        newOrder.candidateEmail,
+        newOrder.candidatePhone,
+        newOrder.registrationNumber,
+        newOrder.checksum,
+        newOrder.createdAt,
+        newOrder.updatedAt,
+      ]
+    );
 
     return { success: true, order: newOrder };
   },
@@ -185,24 +191,31 @@ export const paymentStore = {
   /**
    * APPROVE PAYMENT with Anti-Tampering & Idempotency Checks
    */
-  approvePayment(
+  async approvePayment(
     orderId: string,
     paymentMethod = 'HDFC SmartGateway',
     customTxnId?: string,
     bankRef?: string
-  ): {
+  ): Promise<{
     success: boolean;
     order?: PaymentOrderRecord;
     error?: string;
     code?: string;
     isDuplicate?: boolean;
-  } {
-    const orders = loadOrders();
-    const order = orders[orderId];
+  }> {
+    await ensureDatabaseTables();
+    const db = getDbPool();
 
-    if (!order) {
+    const [rows]: any = await db.query(
+      'SELECT * FROM payment_orders WHERE order_id = ? LIMIT 1',
+      [orderId]
+    );
+
+    if (!rows || rows.length === 0) {
       return { success: false, error: `Order ${orderId} not found.`, code: 'ORDER_NOT_FOUND' };
     }
+
+    const order = mapRowToOrder(rows[0]);
 
     // 1. IDEMPOTENT / DOUBLE PAYMENT CHECK: Already charged?
     if (order.status === 'CHARGED') {
@@ -242,36 +255,45 @@ export const paymentStore = {
       };
     }
 
-    // 5. Update Order to CHARGED
+    // 5. Update Order to CHARGED in Database
     const txnId = customTxnId || this.generateTxnId();
     const now = new Date().toISOString();
+    const resolvedBankRef = bankRef || `HDFC_REF_${Date.now()}`;
+
+    await db.query(
+      `UPDATE payment_orders
+       SET status = 'CHARGED', txn_id = ?, payment_method = ?, bank_ref = ?, paid_at = ?, updated_at = ?
+       WHERE order_id = ?`,
+      [txnId, paymentMethod, resolvedBankRef, now, now, orderId]
+    );
+
+    // 6. Record in User Ledger Table
+    await db.query(
+      `INSERT INTO user_ledgers (
+        registration_number, due_id, due_title, order_id, txn_id, amount, paid_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?)
+      ON DUPLICATE KEY UPDATE
+        order_id = VALUES(order_id),
+        txn_id = VALUES(txn_id),
+        amount = VALUES(amount),
+        paid_at = VALUES(paid_at)`,
+      [
+        order.registrationNumber,
+        order.dueId,
+        order.dueTitle,
+        order.orderId,
+        txnId,
+        order.amount,
+        now,
+      ]
+    );
+
     order.status = 'CHARGED';
     order.txnId = txnId;
     order.paymentMethod = paymentMethod;
-    order.bankRef = bankRef || `HDFC_REF_${Date.now()}`;
+    order.bankRef = resolvedBankRef;
     order.paidAt = now;
     order.updatedAt = now;
-
-    orders[orderId] = order;
-    saveOrders(orders);
-
-    // 6. Record in User Ledger
-    const ledgers = loadLedgers();
-    if (!ledgers[order.registrationNumber]) {
-      ledgers[order.registrationNumber] = {
-        registrationNumber: order.registrationNumber,
-        paidDues: {},
-      };
-    }
-    ledgers[order.registrationNumber].paidDues[order.dueId] = {
-      dueId: order.dueId,
-      dueTitle: order.dueTitle,
-      orderId: order.orderId,
-      txnId,
-      amount: order.amount,
-      paidAt: now,
-    };
-    saveLedgers(ledgers);
 
     return { success: true, order };
   },
@@ -279,17 +301,24 @@ export const paymentStore = {
   /**
    * CANCEL PAYMENT with Clean State Transition
    */
-  cancelPayment(orderId: string, reason = 'User aborted gateway payment'): {
+  async cancelPayment(orderId: string, reason = 'User aborted gateway payment'): Promise<{
     success: boolean;
     order?: PaymentOrderRecord;
     error?: string;
-  } {
-    const orders = loadOrders();
-    const order = orders[orderId];
+  }> {
+    await ensureDatabaseTables();
+    const db = getDbPool();
 
-    if (!order) {
+    const [rows]: any = await db.query(
+      'SELECT * FROM payment_orders WHERE order_id = ? LIMIT 1',
+      [orderId]
+    );
+
+    if (!rows || rows.length === 0) {
       return { success: false, error: `Order ${orderId} not found.` };
     }
+
+    const order = mapRowToOrder(rows[0]);
 
     if (order.status === 'CHARGED') {
       return {
@@ -299,13 +328,18 @@ export const paymentStore = {
     }
 
     const now = new Date().toISOString();
+
+    await db.query(
+      `UPDATE payment_orders
+       SET status = 'CANCELLED', cancelled_at = ?, cancel_reason = ?, updated_at = ?
+       WHERE order_id = ?`,
+      [now, reason, now, orderId]
+    );
+
     order.status = 'CANCELLED';
     order.cancelledAt = now;
     order.cancelReason = reason;
     order.updatedAt = now;
-
-    orders[orderId] = order;
-    saveOrders(orders);
 
     return { success: true, order };
   },
@@ -313,17 +347,24 @@ export const paymentStore = {
   /**
    * MARK PAYMENT FAILED
    */
-  markPaymentFailed(orderId: string, reason = 'Bank payment declined'): {
+  async markPaymentFailed(orderId: string, reason = 'Bank payment declined'): Promise<{
     success: boolean;
     order?: PaymentOrderRecord;
     error?: string;
-  } {
-    const orders = loadOrders();
-    const order = orders[orderId];
+  }> {
+    await ensureDatabaseTables();
+    const db = getDbPool();
 
-    if (!order) {
+    const [rows]: any = await db.query(
+      'SELECT * FROM payment_orders WHERE order_id = ? LIMIT 1',
+      [orderId]
+    );
+
+    if (!rows || rows.length === 0) {
       return { success: false, error: `Order ${orderId} not found.` };
     }
+
+    const order = mapRowToOrder(rows[0]);
 
     if (order.status === 'CHARGED') {
       return {
@@ -333,12 +374,17 @@ export const paymentStore = {
     }
 
     const now = new Date().toISOString();
+
+    await db.query(
+      `UPDATE payment_orders
+       SET status = 'FAILED', cancel_reason = ?, updated_at = ?
+       WHERE order_id = ?`,
+      [reason, now, orderId]
+    );
+
     order.status = 'FAILED';
     order.cancelReason = reason;
     order.updatedAt = now;
-
-    orders[orderId] = order;
-    saveOrders(orders);
 
     return { success: true, order };
   },
@@ -346,49 +392,78 @@ export const paymentStore = {
   /**
    * Get Order by ID
    */
-  getOrder(orderId: string): PaymentOrderRecord | null {
-    const orders = loadOrders();
-    return orders[orderId] || null;
+  async getOrder(orderId: string): Promise<PaymentOrderRecord | null> {
+    await ensureDatabaseTables();
+    const db = getDbPool();
+
+    const [rows]: any = await db.query(
+      'SELECT * FROM payment_orders WHERE order_id = ? LIMIT 1',
+      [orderId]
+    );
+
+    if (!rows || rows.length === 0) {
+      return null;
+    }
+
+    return mapRowToOrder(rows[0]);
   },
 
   /**
    * Get user paid dues ledger
    */
-  getUserLedger(registrationNumber: string): UserDueLedger {
-    const ledgers = loadLedgers();
-    return ledgers[registrationNumber] || {
+  async getUserLedger(registrationNumber: string): Promise<UserDueLedger> {
+    await ensureDatabaseTables();
+    const db = getDbPool();
+
+    const [rows]: any = await db.query(
+      'SELECT * FROM user_ledgers WHERE registration_number = ?',
+      [registrationNumber]
+    );
+
+    const paidDues: UserDueLedger['paidDues'] = {};
+    if (rows && rows.length > 0) {
+      for (const row of rows) {
+        paidDues[row.due_id] = {
+          dueId: row.due_id,
+          dueTitle: row.due_title,
+          orderId: row.order_id,
+          txnId: row.txn_id,
+          amount: Number(row.amount),
+          paidAt: row.paid_at,
+        };
+      }
+    }
+
+    return {
       registrationNumber,
-      paidDues: {},
+      paidDues,
     };
   },
 
   /**
-   * Reset all user dues (Test Helper)
+   * Reset user dues (Test Helper)
    */
-  resetUserDues(registrationNumber?: string) {
-    const ledgers = loadLedgers();
-    if (!registrationNumber || registrationNumber === 'all') {
-      Object.keys(ledgers).forEach((key) => delete ledgers[key]);
-    } else {
-      delete ledgers[registrationNumber];
-    }
-    saveLedgers(ledgers);
+  async resetUserDues(registrationNumber?: string): Promise<void> {
+    await ensureDatabaseTables();
+    const db = getDbPool();
+    const now = new Date().toISOString();
 
-    // Also cancel charged orders for reset candidates so idempotency doesn't block future tests
-    const orders = loadOrders();
-    let hasOrderChanges = false;
-    Object.values(orders).forEach((ord) => {
-      if (!registrationNumber || registrationNumber === 'all' || ord.registrationNumber === registrationNumber) {
-        if (ord.status === 'CHARGED') {
-          ord.status = 'CANCELLED';
-          ord.cancelReason = 'Test dues reset by operator';
-          ord.updatedAt = new Date().toISOString();
-          hasOrderChanges = true;
-        }
-      }
-    });
-    if (hasOrderChanges) {
-      saveOrders(orders);
+    if (!registrationNumber || registrationNumber === 'all') {
+      await db.query('DELETE FROM user_ledgers');
+      await db.query(
+        `UPDATE payment_orders
+         SET status = 'CANCELLED', cancel_reason = 'Test dues reset by operator', updated_at = ?
+         WHERE status = 'CHARGED'`,
+        [now]
+      );
+    } else {
+      await db.query('DELETE FROM user_ledgers WHERE registration_number = ?', [registrationNumber]);
+      await db.query(
+        `UPDATE payment_orders
+         SET status = 'CANCELLED', cancel_reason = 'Test dues reset by operator', updated_at = ?
+         WHERE registration_number = ? AND status = 'CHARGED'`,
+        [now, registrationNumber]
+      );
     }
   },
 };
